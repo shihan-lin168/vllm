@@ -5883,6 +5883,20 @@ class GPUModelRunner(
             num_reqs_padded,
             self.vllm_config.parallel_config.num_ubatches,
         )
+        if is_graph_capturing:
+            logger.info(
+                "CUDA graph capture inputs: TP rank=%d, mode=%s, size=%d, "
+                "uniform=%s, allow_microbatching=%s, should_ubatch=%s, "
+                "num_ubatches=%d, profile_seq_lens=%s",
+                get_tp_group().rank_in_group,
+                cudagraph_runtime_mode.name,
+                batch_desc.num_tokens,
+                batch_desc.uniform,
+                allow_microbatching,
+                should_ubatch,
+                self.vllm_config.parallel_config.num_ubatches,
+                profile_seq_lens,
+            )
         logger.debug(
             "ubatch_slices: %s, ubatch_slices_padded: %s",
             ubatch_slices,
@@ -6533,6 +6547,30 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        experiment_mode = getattr(
+            self, "_cudagraph_memory_experiment_mode", ""
+        )
+        metadata_experiment_modes = (
+            "metadata_keep",
+            "metadata_release",
+        )
+        metadata_experiment = experiment_mode in metadata_experiment_modes
+        preprofile_experiment_modes = (
+            "profile",
+            "setup_only",
+            "warmup_only",
+            "capture_only",
+            *metadata_experiment_modes,
+        )
+        profile_residual_before = None
+        if experiment_mode in preprofile_experiment_modes:
+            torch.accelerator.synchronize()
+            torch.accelerator.empty_cache()
+            profile_residual_before = self._cudagraph_memory_snapshot()
+            self._log_cudagraph_memory_checkpoint(
+                "before_profile", profile_residual_before
+            )
+
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -6594,26 +6632,80 @@ class GPUModelRunner(
                 torch.accelerator.empty_cache()
 
                 for mode, descs in capture_descs:
-                    profile_descs = descs[:2]
+                    if metadata_experiment and mode != CUDAGraphMode.FULL:
+                        continue
+                    profile_descs = (
+                        descs[:1] if metadata_experiment else descs[:2]
+                    )
                     mem_samples: list[int] = []
 
                     for i, desc in enumerate(profile_descs):
-                        mem_before = torch.accelerator.get_memory_info()[0]
-                        self._warmup_and_capture(
-                            desc,
-                            cudagraph_runtime_mode=mode,
-                            profile_seq_lens=(
-                                min(
-                                    self.max_model_len,
-                                    self.max_num_tokens // desc.num_tokens,
-                                )
-                                if mode == CUDAGraphMode.FULL and i == 0
-                                else None
-                            ),
+                        profile_seq_lens = (
+                            min(
+                                self.max_model_len,
+                                self.max_num_tokens // desc.num_tokens,
+                            )
+                            if mode == CUDAGraphMode.FULL and i == 0
+                            else None
                         )
-                        torch.accelerator.synchronize()
-                        free_after = torch.accelerator.get_memory_info()[0]
-                        mem_samples.append(mem_before - free_after)
+                        memory_snapshots = {
+                            "before_warmup": self._cudagraph_memory_snapshot()
+                        }
+
+                        def record_memory_snapshot(phase: str) -> None:
+                            memory_snapshots[phase] = (
+                                self._cudagraph_memory_snapshot()
+                            )
+
+                        if metadata_experiment:
+                            logger.info(
+                                "CUDA graph metadata ownership experiment: "
+                                "action=%s, mode=%s, size=%d, "
+                                "profile_seq_lens=%s",
+                                experiment_mode,
+                                mode.name,
+                                desc.num_tokens,
+                                profile_seq_lens,
+                            )
+                        self._cudagraph_metadata_experiment_active = (
+                            experiment_mode if metadata_experiment else ""
+                        )
+                        try:
+                            self._warmup_and_capture(
+                                desc,
+                                cudagraph_runtime_mode=mode,
+                                profile_seq_lens=profile_seq_lens,
+                                num_warmups=(
+                                    1
+                                    if metadata_experiment
+                                    else (
+                                        0
+                                        if experiment_mode
+                                        in ("setup_only", "capture_only")
+                                        else None
+                                    )
+                                ),
+                                run_capture=(
+                                    not metadata_experiment
+                                    and experiment_mode
+                                    not in ("setup_only", "warmup_only")
+                                ),
+                                memory_snapshot_callback=record_memory_snapshot,
+                            )
+                        finally:
+                            self._cudagraph_metadata_experiment_active = ""
+                        self._log_cudagraph_memory_breakdown(
+                            source="profile",
+                            desc=desc,
+                            cudagraph_runtime_mode=mode,
+                            requested_microbatching=False,
+                            profile_seq_lens=profile_seq_lens,
+                            memory_snapshots=memory_snapshots,
+                        )
+                        mem_samples.append(
+                            memory_snapshots["before_warmup"][0]
+                            - memory_snapshots["after_capture"][0]
+                        )
 
                     first_capture = mem_samples[0]
                     # Use at least 1 MiB per graph for driver overhead
@@ -6624,6 +6716,18 @@ class GPUModelRunner(
                     shared_memory_estimate[mode] = first_capture
                     per_graph_estimate[mode] = per_graph * (len(descs) - 1)
 
+                    logger.info(
+                        "CUDA graph estimate extrapolation: TP rank=%d, "
+                        "mode=%s, graphs=%d, first=%.2f MiB, "
+                        "per_graph=%.2f MiB, extrapolated=%.2f MiB",
+                        get_tp_group().rank_in_group,
+                        mode.name,
+                        len(descs),
+                        first_capture / (1 << 20),
+                        per_graph / (1 << 20),
+                        per_graph_estimate[mode] / (1 << 20),
+                    )
+
                     logger.debug(
                         "Estimated %s CUDA graph memory: "
                         "%.2f MiB first-capture + (%d-1) × %.2f MiB per-graph",
@@ -6633,7 +6737,10 @@ class GPUModelRunner(
                         per_graph / (1 << 20),
                     )
 
-                if encoder_cudagraph_manager is not None:
+                if (
+                    encoder_cudagraph_manager is not None
+                    and not metadata_experiment
+                ):
                     mem_before = torch.accelerator.get_memory_info()[0]
                     encoder_cudagraph_manager.capture(graph_pool=encoder_profiling_pool)
                     torch.accelerator.synchronize()
@@ -6663,6 +6770,16 @@ class GPUModelRunner(
             self.maybe_remove_all_loras(self.lora_config)
             self._cleanup_profiling_kv_cache()
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
+            if profile_residual_before is not None:
+                profile_residual_after = self._cudagraph_memory_snapshot()
+                self._log_cudagraph_memory_checkpoint(
+                    "after_profile_cleanup", profile_residual_after
+                )
+                self._log_cudagraph_experiment_delta(
+                    "profile_residual",
+                    profile_residual_before,
+                    profile_residual_after,
+                )
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are
         # never replayed concurrently, so the pool overlays their memory.
@@ -6703,7 +6820,18 @@ class GPUModelRunner(
         with self._freeze_gc(), graph_capture(device=self.device):
             torch.accelerator.synchronize()
             torch.accelerator.empty_cache()
-            start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            experiment_mode = getattr(
+                self, "_cudagraph_memory_experiment_mode", ""
+            )
+            if experiment_mode:
+                capture_start_snapshot = self._cudagraph_memory_snapshot()
+                self._log_cudagraph_memory_checkpoint(
+                    "before_capture_model", capture_start_snapshot
+                )
+                start_free_gpu_memory = capture_start_snapshot[0]
+            else:
+                capture_start_snapshot = None
+                start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
             for (
                 runtime_mode,
@@ -6721,7 +6849,19 @@ class GPUModelRunner(
                 self.encoder_cudagraph_manager.capture(graph_pool=encoder_graph_pool)
 
             torch.accelerator.synchronize()
-            end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+            if capture_start_snapshot is not None:
+                capture_end_snapshot = self._cudagraph_memory_snapshot()
+                self._log_cudagraph_memory_checkpoint(
+                    "after_capture_model", capture_end_snapshot
+                )
+                self._log_cudagraph_experiment_delta(
+                    "capture_model",
+                    capture_start_snapshot,
+                    capture_end_snapshot,
+                )
+                end_free_gpu_memory = capture_end_snapshot[0]
+            else:
+                end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
         # Disable cudagraph capturing globally, so any unexpected cudagraph
         # capturing will be detected and raise an error after here.
@@ -6748,6 +6888,105 @@ class GPUModelRunner(
         )
         return cuda_graph_size
 
+    def _cudagraph_memory_snapshot(self) -> tuple[int, int, int, int]:
+        torch.accelerator.synchronize()
+        free_memory, total_memory = torch.accelerator.get_memory_info()
+        memory_stats = torch.accelerator.memory_stats(self.device)
+        allocated_memory = memory_stats.get("allocated_bytes.all.current", 0)
+        reserved_memory = memory_stats.get("reserved_bytes.all.current", 0)
+        return free_memory, allocated_memory, reserved_memory, total_memory
+
+    def _log_cudagraph_memory_checkpoint(
+        self,
+        checkpoint: str,
+        snapshot: tuple[int, int, int, int],
+    ) -> None:
+        free_memory, allocated_memory, reserved_memory, total_memory = snapshot
+        non_allocator_memory = total_memory - free_memory - reserved_memory
+        logger.info(
+            "CUDA graph experiment checkpoint: checkpoint=%s, TP rank=%d, "
+            "free=%.2f MiB, allocated=%.2f MiB, reserved=%.2f MiB, "
+            "non_allocator=%.2f MiB",
+            checkpoint,
+            get_tp_group().rank_in_group,
+            free_memory / (1 << 20),
+            allocated_memory / (1 << 20),
+            reserved_memory / (1 << 20),
+            non_allocator_memory / (1 << 20),
+        )
+
+    def _log_cudagraph_experiment_delta(
+        self,
+        phase: str,
+        before: tuple[int, int, int, int],
+        after: tuple[int, int, int, int],
+    ) -> None:
+        device_delta = before[0] - after[0]
+        allocated_delta = after[1] - before[1]
+        reserved_delta = after[2] - before[2]
+        logger.info(
+            "CUDA graph experiment delta: phase=%s, TP rank=%d, "
+            "device=%+.2f MiB, allocated=%+.2f MiB, "
+            "reserved=%+.2f MiB, non_allocator=%+.2f MiB",
+            phase,
+            get_tp_group().rank_in_group,
+            device_delta / (1 << 20),
+            allocated_delta / (1 << 20),
+            reserved_delta / (1 << 20),
+            (device_delta - reserved_delta) / (1 << 20),
+        )
+
+    def _log_cudagraph_memory_breakdown(
+        self,
+        source: str,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        requested_microbatching: bool,
+        profile_seq_lens: int | None,
+        memory_snapshots: dict[str, tuple[int, int, int, int]],
+    ) -> None:
+        phases = (
+            (
+                "warmup",
+                memory_snapshots["before_warmup"],
+                memory_snapshots["after_warmup"],
+            ),
+            (
+                "capture",
+                memory_snapshots["after_warmup"],
+                memory_snapshots["after_capture"],
+            ),
+            (
+                "total",
+                memory_snapshots["before_warmup"],
+                memory_snapshots["after_capture"],
+            ),
+        )
+        for phase, before, after in phases:
+            device_delta = before[0] - after[0]
+            allocated_delta = after[1] - before[1]
+            reserved_delta = after[2] - before[2]
+            logger.info(
+                "CUDA graph memory breakdown: source=%s, phase=%s, "
+                "TP rank=%d, mode=%s, size=%d, uniform=%s, loras=%d, "
+                "requested_microbatching=%s, profile_seq_lens=%s, "
+                "device=%+.2f MiB, allocated=%+.2f MiB, "
+                "reserved=%+.2f MiB, non_allocator=%+.2f MiB",
+                source,
+                phase,
+                get_tp_group().rank_in_group,
+                cudagraph_runtime_mode.name,
+                desc.num_tokens,
+                desc.uniform,
+                desc.num_active_loras,
+                requested_microbatching,
+                profile_seq_lens,
+                device_delta / (1 << 20),
+                allocated_delta / (1 << 20),
+                reserved_delta / (1 << 20),
+                (device_delta - reserved_delta) / (1 << 20),
+            )
+
     def _warmup_and_capture(
         self,
         desc: BatchDescriptor,
@@ -6755,6 +6994,8 @@ class GPUModelRunner(
         profile_seq_lens: int | None = None,
         allow_microbatching: bool = False,
         num_warmups: int | None = None,
+        run_capture: bool = True,
+        memory_snapshot_callback: Callable[[str], None] | None = None,
     ):
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
@@ -6771,6 +7012,12 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
             )
+        if memory_snapshot_callback is not None:
+            memory_snapshot_callback("after_warmup")
+        if not run_capture:
+            if memory_snapshot_callback is not None:
+                memory_snapshot_callback("after_capture")
+            return
         self._dummy_run(
             desc.num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -6782,6 +7029,8 @@ class GPUModelRunner(
             is_graph_capturing=True,
             profile_seq_lens=profile_seq_lens,
         )
+        if memory_snapshot_callback is not None:
+            memory_snapshot_callback("after_capture")
 
     def _capture_cudagraphs(
         self,
@@ -6825,12 +7074,27 @@ class GPUModelRunner(
                     uniform_decode=uniform_decode,
                 )
             )
+            memory_snapshots = {
+                "before_warmup": self._cudagraph_memory_snapshot()
+            }
+
+            def record_memory_snapshot(phase: str) -> None:
+                memory_snapshots[phase] = self._cudagraph_memory_snapshot()
+
             self._warmup_and_capture(
                 batch_desc,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 allow_microbatching=allow_microbatching,
+                memory_snapshot_callback=record_memory_snapshot,
             )
-            torch.accelerator.synchronize()
+            self._log_cudagraph_memory_breakdown(
+                source="actual",
+                desc=batch_desc,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                requested_microbatching=allow_microbatching,
+                profile_seq_lens=None,
+                memory_snapshots=memory_snapshots,
+            )
         self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(
