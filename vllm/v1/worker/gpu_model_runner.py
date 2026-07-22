@@ -6553,6 +6553,7 @@ class GPUModelRunner(
         metadata_experiment_modes = (
             "metadata_keep",
             "metadata_release",
+            "mask_release",
         )
         metadata_experiment = experiment_mode in metadata_experiment_modes
         preprofile_experiment_modes = (
